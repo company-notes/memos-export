@@ -49,22 +49,22 @@ python -m unittest -v test_transfer_memo_owner.py
 
 ## 在同一個 Docker container 內暫停 / 恢復 Memos（Supervisor）
 
-**原始 \`neosmemo/memos:0.31.0\` 不支援這種操作**：其 entrypoint 會 \`exec\` Memos，因此 server 是 container 的主程序；結束它會連帶停止 container。要讓 container 持續運行，需要**重新建置／部署一次**以 Supervisor 作為 PID 1，讓 Memos 成為 Supervisor 管理的子程序。之後每次轉讓只停 Memos 程序、不停 container。
+**原始 `neosmemo/memos:0.31.0` 不支援這種操作**：其 entrypoint 會 `exec` Memos，因此 server 是 container 的主程序；結束它會連帶停止 container。要讓 container 持續運行，需要**重新建置／部署一次**以 Supervisor 作為 PID 1，讓 Memos 成為 Supervisor 管理的子程序。之後每次轉讓只停 Memos 程序、不停 container。
 
 自訂 Alpine image 的 Dockerfile 可加入：
 
-\`\`\`dockerfile
+```dockerfile
 USER root
 RUN apk add --no-cache python3 supervisor
 COPY scripts/docker/supervisord.conf /etc/supervisord.conf
 ENTRYPOINT ["/usr/bin/supervisord", "-n", "-c", "/etc/supervisord.conf"]
-\`\`\`
+```
 
-如果你的 Docker build context **沒有**這個 repo 的 \`scripts/docker/\`，請把同名設定檔以現有建置系統的方式放進 image，或改用 inline \`RUN printf\` 建立設定檔。Supervisor 設定刻意沿用 **原本的** \`/usr/local/memos/entrypoint.sh /usr/local/memos/memos\`，保留自動調整 volume owner、降權、讀取 \`MEMOS_DSN_FILE\` 等既有行為。Supervisor 控制 socket 只允許 root 存取。
+如果你的 Docker build context **沒有**這個 repo 的 `scripts/docker/`，請把同名設定檔以現有建置系統的方式放進 image，或改用 inline `RUN printf` 建立設定檔。Supervisor 設定刻意沿用 **原本的** `/usr/local/memos/entrypoint.sh /usr/local/memos/memos`，保留自動調整 volume owner、降權、讀取 `MEMOS_DSN_FILE` 等既有行為。Supervisor 控制 socket 只允許 root 存取。
 
 使用方式（先確定 server 已啟動，並先執行轉讓的 dry-run）：
 
-\`\`\`bash
+```bash
 # container 名稱自行替換；確認新 image 已由 supervisord 管理
 docker exec -u 0 YOUR_CONTAINER supervisorctl status memos
 
@@ -76,8 +76,8 @@ docker exec -u 0 YOUR_CONTAINER sh /opt/memos-tools/with_memos_stopped.sh \
 
 # 確認恢復
 docker exec -u 0 YOUR_CONTAINER supervisorctl status memos
-\`\`\`
+```
 
-\`with_memos_stopped.sh\` 會先確認 Memos 為 RUNNING，接著執行 \`supervisorctl stop memos\`，將 \`--stopped\` 傳入 Python 轉讓工具，並在**正常結束或出錯**時嘗試 \`supervisorctl start memos\`。如果整個 exec 行程被 \`SIGKILL\`、機器當機，或啟動失敗，cleanup 無法保證執行；請手動使用 \`supervisorctl start memos\` 復原。
+`with_memos_stopped.sh` 會先確認 Memos 為 RUNNING，接著執行 `supervisorctl stop memos`，將 `--stopped` 傳入 Python 轉讓工具，並在**正常結束或出錯**時嘗試 `supervisorctl start memos`。如果整個 exec 行程被 `SIGKILL`、機器當機，或啟動失敗，cleanup 無法保證執行；請手動使用 `supervisorctl start memos` 復原。
 
-如需手動操作，依序用 \`supervisorctl stop memos\` → Python 轉讓命令（加 \`--apply --stopped --confirm\`）→ \`supervisorctl start memos\`。**服務停止期間網站會暫時不可用**，但 container 本身保持 RUNNING。不要使用 \`kill -9\`、\`SIGSTOP/SIGCONT\` 或直接關閉 container 的 PID 1 來替代正常關閉。先備份整個 volume，轉讓工具的 SQLite 備份不包含獨立附件檔。
+如需手動操作，依序用 `supervisorctl stop memos` → Python 轉讓命令（加 `--apply --stopped --confirm`）→ `supervisorctl start memos`。**服務停止期間網站會暫時不可用**，但 container 本身保持 RUNNING。不要使用 `kill -9`、`SIGSTOP/SIGCONT` 或直接關閉 container 的 PID 1 來替代正常關閉。先備份整個 volume，轉讓工具的 SQLite 備份不包含獨立附件檔。
