@@ -1,11 +1,13 @@
-"""Integration tests for the offline SQLite transfer CLI (no Memos server needed)."""
+"""SQLite integration and concurrency tests for the offline/online transfer CLI."""
 
+import importlib.util
 from pathlib import Path
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 SCRIPT = Path(__file__).parent / "scripts" / "transfer_memo_owner.py"
 
@@ -25,11 +27,11 @@ class TestMemoOwnerTransfer(unittest.TestCase):
                     id INTEGER PRIMARY KEY, uid TEXT NOT NULL UNIQUE,
                     creator_id INTEGER NOT NULL, content TEXT NOT NULL,
                     visibility TEXT NOT NULL, row_status TEXT NOT NULL,
-                    space_id INTEGER
+                    space_id INTEGER, updated_ts INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE attachment (
                     id INTEGER PRIMARY KEY, uid TEXT UNIQUE, creator_id INTEGER,
-                    memo_id INTEGER
+                    memo_id INTEGER, updated_ts INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE space_member (
                     space_id INTEGER, user_id INTEGER, status TEXT, role TEXT,
@@ -38,9 +40,9 @@ class TestMemoOwnerTransfer(unittest.TestCase):
                 INSERT INTO user VALUES (1, 'alice', 'NORMAL', 'USER');
                 INSERT INTO user VALUES (2, 'bob', 'NORMAL', 'USER');
                 INSERT INTO user VALUES (3, 'charlie', 'ARCHIVED', 'USER');
-                INSERT INTO memo VALUES (11, 'first', 1, 'keep this', 'PRIVATE', 'NORMAL', NULL);
-                INSERT INTO memo VALUES (12, 'second', 1, 'other', 'PROTECTED', 'ARCHIVED', NULL);
-                INSERT INTO attachment VALUES (21, 'att21', 1, 11);
+                INSERT INTO memo VALUES (11, 'first', 1, 'keep this', 'PRIVATE', 'NORMAL', NULL, 0);
+                INSERT INTO memo VALUES (12, 'second', 1, 'other', 'PROTECTED', 'ARCHIVED', NULL, 0);
+                INSERT INTO attachment VALUES (21, 'att21', 1, 11, 0);
             """)
 
     def run_tool(self, *flags):
@@ -127,6 +129,93 @@ class TestMemoOwnerTransfer(unittest.TestCase):
             capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(missing.exists())
+
+    def online(self, *extra):
+        return self.run_tool("--memo", "first", "--apply", "--online",
+                             "--confirm", "alice->bob", *extra)
+
+    def load_module(self):
+        spec = importlib.util.spec_from_file_location("memos_owner_transfer_tested", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def run_with_intervening_change(self, sql):
+        module = self.load_module()
+        original_backup = module.backup_database
+
+        def concurrent_writer(db, path):
+            original_backup(db, path)
+            with sqlite3.connect(self.db_path) as writer:
+                writer.execute(sql)
+
+        flags = [
+            "--db", str(self.db_path), "--from-user", "alice", "--to-user", "bob",
+            "--memo", "first", "--apply", "--online", "--confirm", "alice->bob",
+        ]
+        with mock.patch.object(module, "backup_database", concurrent_writer):
+            with self.assertRaisesRegex(module.TransferError, "changed during preview/backup"):
+                module.run(module.parser().parse_args(flags))
+
+    def test_online_transfer_succeeds_without_stopped_flag(self):
+        result = self.online("--lock-timeout", "3")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ONLINE", result.stdout)
+        self.assertEqual(self.select("SELECT creator_id FROM memo WHERE uid='first'"), [(2,)])
+        self.assertEqual(self.select("SELECT creator_id FROM attachment WHERE id=21"), [(2,)])
+
+    def test_online_requires_explicit_mode_and_confirmation(self):
+        self.assertNotEqual(self.run_tool("--memo", "first", "--apply", "--confirm", "alice->bob").returncode, 0)
+        self.assertNotEqual(self.run_tool("--memo", "first", "--apply", "--online").returncode, 0)
+        self.assertNotEqual(self.run_tool("--memo", "first", "--apply", "--online",
+                                          "--offline", "--confirm", "alice->bob").returncode, 0)
+        self.assertEqual(self.select("SELECT creator_id FROM memo WHERE id=11"), [(1,)])
+
+    def test_online_write_lock_timeout_has_no_partial_transfer(self):
+        with sqlite3.connect(self.db_path, isolation_level=None) as writer:
+            writer.execute("PRAGMA journal_mode = WAL")
+            writer.execute("BEGIN IMMEDIATE")
+            try:
+                result = self.online("--lock-timeout", "0.1")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("could not obtain SQLite write lock", result.stderr)
+            finally:
+                writer.execute("ROLLBACK")
+        self.assertEqual(self.select("SELECT creator_id FROM memo WHERE id=11"), [(1,)])
+        self.assertEqual(self.select("SELECT creator_id FROM attachment WHERE id=21"), [(1,)])
+
+    def test_online_content_change_between_backup_and_lock_aborts(self):
+        self.run_with_intervening_change(
+            "UPDATE memo SET content = 'new server version', updated_ts=42 WHERE id=11"
+        )
+        self.assertEqual(self.select("SELECT creator_id, content FROM memo WHERE id=11"),
+                         [(1, "new server version")])
+
+    def test_online_attachment_change_between_backup_and_lock_aborts(self):
+        self.run_with_intervening_change(
+            "UPDATE attachment SET updated_ts=42 WHERE id=21"
+        )
+        self.assertEqual(self.select("SELECT creator_id FROM memo WHERE id=11"), [(1,)])
+        self.assertEqual(self.select("SELECT creator_id FROM attachment WHERE id=21"), [(1,)])
+
+    def test_online_rollback_if_second_memo_update_fails(self):
+        with sqlite3.connect(self.db_path) as db:
+            db.executescript("""
+                CREATE TRIGGER fail_second_transfer
+                  BEFORE UPDATE OF creator_id ON memo
+                  WHEN OLD.uid = 'second'
+                  BEGIN SELECT RAISE(ABORT, 'simulated failure'); END;
+            """)
+        result = self.run_tool("--all", "--apply", "--online", "--confirm", "alice->bob")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("simulated failure", result.stderr)
+        self.assertEqual(self.select("SELECT creator_id FROM memo ORDER BY id"), [(1,), (1,)])
+        self.assertEqual(self.select("SELECT creator_id FROM attachment WHERE id=21"), [(1,)])
+
+    def test_online_rejects_invalid_lock_timeout(self):
+        result = self.online("--lock-timeout", "-1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("lock timeout must be between", result.stderr)
 
 
 if __name__ == "__main__":
