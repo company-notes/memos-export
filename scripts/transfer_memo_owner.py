@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Offline Memos v0.31.x SQLite memo-ownership transfer (no REST API writes)."""
+"""Memos v0.31.0 SQLite memo ownership transfer: dry-run, online or offline."""
 
 from __future__ import annotations
 
 import argparse
 from collections import Counter
+from contextlib import closing
 from datetime import datetime, timezone
+import math
 import os
 from pathlib import Path
 import sqlite3
 import sys
-from urllib.parse import unquote
 
 
 class TransferError(Exception):
@@ -28,7 +29,7 @@ def memo_uid(value: str) -> str:
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--db", required=True, type=Path, help="path to the STOPPED Memos SQLite database")
+    p.add_argument("--db", required=True, type=Path, help="path to the Memos v0.31.0 SQLite database")
     p.add_argument("--from-user", required=True, help="exact existing username (case-sensitive)")
     p.add_argument("--to-user", required=True, help="exact target username (case-sensitive)")
     selection = p.add_mutually_exclusive_group(required=True)
@@ -36,21 +37,36 @@ def parser() -> argparse.ArgumentParser:
     selection.add_argument("--all", action="store_true", help="all memos owned by --from-user, including archived and comments")
     p.add_argument("--apply", action="store_true", help="actually change database rows (default: dry run)")
     p.add_argument("--confirm", metavar="FROM->TO", help="required with --apply, e.g. alice->bob")
-    p.add_argument("--stopped", action="store_true", help="acknowledge that Memos and all other DB writers are STOPPED")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--online", action="store_true", help="apply while Memos may be running (experimental)")
+    mode.add_argument("--offline", "--stopped", dest="stopped", action="store_true",
+                      help="acknowledge all database writers are stopped (recommended)")
+    p.add_argument("--lock-timeout", type=lock_timeout, default=10.0, metavar="SECONDS",
+                   help="SQLite busy/write-lock wait, 0-300 seconds (default: 10)")
     p.add_argument("--backup", type=Path, help="new backup path; default: generated next to the database")
     return p
 
 
-def open_db(path: Path, *, write: bool) -> sqlite3.Connection:
+def lock_timeout(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("lock timeout must be a number of seconds") from exc
+    if not math.isfinite(seconds) or not 0 <= seconds <= 300:
+        raise argparse.ArgumentTypeError("lock timeout must be between 0 and 300 seconds")
+    return seconds
+
+
+def open_db(path: Path, *, write: bool, lock_wait: float) -> sqlite3.Connection:
     if not path.is_file():
         raise TransferError(f"database file not found: {path}")
     with path.open("rb") as f:
         if f.read(16) != b"SQLite format 3\x00":
             raise TransferError("file is not a SQLite database")
     mode = "rw" if write else "ro"
-    db = sqlite3.connect(path.resolve().as_uri() + f"?mode={mode}", uri=True, timeout=1)
+    db = sqlite3.connect(path.resolve().as_uri() + f"?mode={mode}", uri=True, timeout=lock_wait)
     db.row_factory = sqlite3.Row
-    db.execute("PRAGMA busy_timeout = 1000")
+    db.execute(f"PRAGMA busy_timeout = {int(lock_wait * 1000)}")
     if not write:
         db.execute("PRAGMA query_only = ON")
     return db
@@ -58,9 +74,9 @@ def open_db(path: Path, *, write: bool) -> sqlite3.Connection:
 
 def validate_schema(db: sqlite3.Connection) -> None:
     required = {
-        "memo": {"id", "uid", "creator_id", "visibility", "row_status", "space_id"},
+        "memo": {"id", "uid", "creator_id", "visibility", "row_status", "space_id", "updated_ts", "content"},
         "user": {"id", "username", "row_status", "role"},
-        "attachment": {"id", "creator_id", "memo_id"},
+        "attachment": {"id", "creator_id", "memo_id", "updated_ts"},
         "space_member": {"space_id", "user_id", "status", "role"},
     }
     for table, columns in required.items():
@@ -79,7 +95,7 @@ def get_user(db: sqlite3.Connection, username: str) -> sqlite3.Row:
     return rows[0]
 
 
-def plan(db: sqlite3.Connection, args: argparse.Namespace) -> tuple[list[sqlite3.Row], dict[int, int]]:
+def plan(db: sqlite3.Connection, args: argparse.Namespace) -> tuple[list[sqlite3.Row], dict[int, tuple[tuple, ...]]]:
     source = get_user(db, args.from_user)
     target = get_user(db, args.to_user)
     if source["id"] == target["id"]:
@@ -88,14 +104,16 @@ def plan(db: sqlite3.Connection, args: argparse.Namespace) -> tuple[list[sqlite3
         raise TransferError("target user is not active (row_status must be NORMAL)")
     if args.all:
         memos = db.execute(
-            "SELECT id, uid, creator_id, visibility, row_status, space_id FROM memo WHERE creator_id = ? ORDER BY id",
+            "SELECT id, uid, creator_id, visibility, row_status, space_id, updated_ts, content "
+            "FROM memo WHERE creator_id = ? ORDER BY id",
             (source["id"],),
         ).fetchall()
     else:
         uids = list(dict.fromkeys(args.memo))
         marks = ",".join("?" for _ in uids)
         memos = db.execute(
-            f"SELECT id, uid, creator_id, visibility, row_status, space_id FROM memo WHERE uid IN ({marks}) ORDER BY id",
+            f"SELECT id, uid, creator_id, visibility, row_status, space_id, updated_ts, content "
+            f"FROM memo WHERE uid IN ({marks}) ORDER BY id",
             uids,
         ).fetchall()
         missing = set(uids) - {m["uid"] for m in memos}
@@ -107,7 +125,7 @@ def plan(db: sqlite3.Connection, args: argparse.Namespace) -> tuple[list[sqlite3
     if not memos:
         raise TransferError("no memos selected; nothing to transfer")
 
-    attachments: dict[int, int] = {}
+    attachments: dict[int, tuple[tuple, ...]] = {}
     for memo in memos:
         if memo["visibility"] == "SPACE":
             if memo["space_id"] is None:
@@ -123,13 +141,13 @@ def plan(db: sqlite3.Connection, args: argparse.Namespace) -> tuple[list[sqlite3
         elif memo["visibility"] not in {"PRIVATE", "PROTECTED", "PUBLIC"}:
             raise TransferError(f"unknown visibility for memo {memo['uid']}: {memo['visibility']}")
         owned = db.execute(
-            "SELECT creator_id, COUNT(*) AS n FROM attachment WHERE memo_id = ? GROUP BY creator_id",
+            "SELECT id, creator_id, memo_id, updated_ts FROM attachment WHERE memo_id = ? ORDER BY id",
             (memo["id"],),
         ).fetchall()
         foreign = [str(a["creator_id"]) for a in owned if a["creator_id"] != source["id"]]
         if foreign:
             raise TransferError(f"memo {memo['uid']} has attachment(s) owned by other users: {', '.join(foreign)}")
-        attachments[memo["id"]] = sum(a["n"] for a in owned)
+        attachments[memo["id"]] = tuple(tuple(row) for row in owned)
     return memos, attachments
 
 
@@ -156,38 +174,60 @@ def backup_database(db: sqlite3.Connection, filename: Path) -> None:
 def run(args: argparse.Namespace) -> int:
     if args.backup and not args.apply:
         raise TransferError("--backup is only used with --apply")
-    if args.apply and (not args.stopped or args.confirm != f"{args.from_user}->{args.to_user}"):
-        raise TransferError("--apply requires --stopped and --confirm 'FROM->TO' matching the usernames")
+    if args.apply and (
+        not (args.online or args.stopped)
+        or args.confirm != f"{args.from_user}->{args.to_user}"
+    ):
+        raise TransferError("--apply requires --online or --offline/--stopped and matching --confirm 'FROM->TO'")
     path = args.db.expanduser().resolve()
-    with open_db(path, write=args.apply) as db:
+    with closing(open_db(path, write=args.apply, lock_wait=args.lock_timeout)) as db:
         validate_schema(db)
         memos, assets = plan(db, args)
+        user_snapshot = (tuple(get_user(db, args.from_user)), tuple(get_user(db, args.to_user)))
         counts = Counter(m["visibility"] for m in memos)
-        print(f"{args.from_user} -> {args.to_user}: {len(memos)} memo(s), {sum(assets.values())} bound attachment(s)")
+        print(f"{args.from_user} -> {args.to_user}: {len(memos)} memo(s), {sum(map(len, assets.values()))} bound attachment(s)")
         print("Visibility: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
         for m in memos[:20]:
-            print(f"  memos/{m['uid']} [{m['visibility']}, {m['row_status']}] attachments={assets[m['id']]}")
+            print(f"  memos/{m['uid']} [{m['visibility']}, {m['row_status']}] attachments={len(assets[m['id']])}")
         if len(memos) > 20:
             print(f"  ... {len(memos) - 20} more memo(s)")
         if not args.apply:
-            print("DRY RUN: nothing changed. Stop Memos, then pass --apply --stopped --confirm 'FROM->TO'.")
+            print("DRY RUN: nothing changed. For writes, pass --apply --online (experimental) "
+                  "or --apply --offline (server stopped), plus --confirm 'FROM->TO'.")
             return 0
 
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         backup = args.backup or path.with_name(f"{path.name}.pre-transfer-{stamp}.sqlite3")
         if backup.expanduser().resolve() == path:
             raise TransferError("backup path cannot be the database itself")
+        # Online backup API captures a consistent snapshot even if the source DB is in WAL mode.
+        # This is intentionally outside the write lock. Changes between backup and lock abort.
         backup_database(db, backup)
-        db.execute("BEGIN IMMEDIATE")
         try:
-            # Re-check the selection under a write lock before touching any rows.
+            db.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                raise TransferError(
+                    f"could not obtain SQLite write lock within {args.lock_timeout:g}s; "
+                    "no memos changed (backup retained)"
+                ) from exc
+            raise
+        try:
+            # Under the write lock, detect API writes occurring during preview/backup.
+            # Compare memo content/timestamp and each attachment identity + updated timestamp,
+            # not merely the number of bound files.
             locked_memos, locked_assets = plan(db, args)
-            if [(m["id"], m["uid"], m["creator_id"], m["visibility"], m["row_status"], m["space_id"]) for m in locked_memos] != [
-                (m["id"], m["uid"], m["creator_id"], m["visibility"], m["row_status"], m["space_id"]) for m in memos
-            ] or locked_assets != assets:
-                raise TransferError("memo selection changed since backup; transaction cancelled")
-            source_id = get_user(db, args.from_user)["id"]
-            target_id = get_user(db, args.to_user)["id"]
+            locked_users = (tuple(get_user(db, args.from_user)), tuple(get_user(db, args.to_user)))
+            if (
+                [tuple(m) for m in locked_memos] != [tuple(m) for m in memos]
+                or locked_assets != assets
+                or locked_users != user_snapshot
+            ):
+                raise TransferError(
+                    "memo, attachment, or user changed during preview/backup; "
+                    "transfer cancelled, rerun the dry-run"
+                )
+            source_id, target_id = user_snapshot[0][0], user_snapshot[1][0]
             for memo in locked_memos:
                 changed = db.execute(
                     "UPDATE memo SET creator_id = ? WHERE id = ? AND creator_id = ?",
@@ -199,13 +239,15 @@ def run(args: argparse.Namespace) -> int:
                     "UPDATE attachment SET creator_id = ? WHERE memo_id = ? AND creator_id = ?",
                     (target_id, memo["id"], source_id),
                 )
-                if changed_assets.rowcount != locked_assets[memo["id"]]:
+                if changed_assets.rowcount != len(locked_assets[memo["id"]]):
                     raise TransferError(f"attachment count changed concurrently: {memo['uid']}")
             db.commit()
         except Exception:
             db.rollback()
             raise
-        print("TRANSFER COMPLETE. Restart Memos; verify access as both accounts.")
+        print("TRANSFER COMPLETE. " +
+              ("ONLINE: verify both accounts; Memos may have stale cached data/session views."
+               if args.online else "OFFLINE: restart Memos and verify access as both accounts."))
         print("Comments, reactions, detached attachments, and Space memberships were not altered.")
         return 0
 
