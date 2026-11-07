@@ -85,7 +85,7 @@ def plan(db: sqlite3.Connection, args: argparse.Namespace) -> tuple[list[sqlite3
     if source["id"] == target["id"]:
         raise TransferError("source and target must be different users")
     if target["row_status"] != "NORMAL":
-        raise TransferError("target user is not active (row_status must be NORMAL")
+        raise TransferError("target user is not active (row_status must be NORMAL)")
     if args.all:
         memos = db.execute(
             "SELECT id, uid, creator_id, visibility, row_status, space_id FROM memo WHERE creator_id = ? ORDER BY id",
