@@ -79,3 +79,7 @@ Test coverage is local and simulated; check results against your real Memos depl
 - Public/Protected notes should be handled carefully after export; the generated files are unencrypted.
 
 Source compatibility target: **Memos v0.31.0**. Earlier or later versions may use different endpoints.
+
+## Database administration tools
+
+For offline SQLite memo ownership transfer (including `PRIVATE` memos), see [`scripts/README.md`](scripts/README.md). Unlike the exporter above, this is a **database-changing** operation, requires the Memos service to be stopped, and creates a backup before applying changes.
