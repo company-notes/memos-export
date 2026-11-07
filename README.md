@@ -82,4 +82,4 @@ Source compatibility target: **Memos v0.31.0**. Earlier or later versions may us
 
 ## Database administration tools
 
-For offline SQLite memo ownership transfer (including `PRIVATE` memos), see [`scripts/README.md`](scripts/README.md). Unlike the exporter above, this is a **database-changing** operation, requires the Memos service to be stopped, and creates a backup before applying changes.
+For offline SQLite memo ownership transfer (including `PRIVATE` memos), see [`scripts/README.md`](scripts/README.md). Unlike the exporter above, this is a **database-changing** operation. It supports experimental online transfers with `--apply --online`, or offline transfers with `--apply --offline` after stopping Memos; both create a SQLite backup before applying changes.
